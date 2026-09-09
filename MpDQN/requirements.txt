@@ -1,0 +1,6 @@
+gymnasium>=1.0,<2
+matplotlib>=3.8,<4
+numpy>=1.26,<3
+pytest>=8,<10
+torch>=2.2
+PyYAML>=6,<7
