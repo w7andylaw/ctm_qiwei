@@ -203,9 +203,13 @@ def save_episodes(directory, episodes):
 
 def load_episodes(
     directory, rescan, length=None, balance=False, seed=0, capacity=None):
+  """Sample eligible episodes; rescan after this many yielded sequences."""
+  if rescan < 1:
+    raise ValueError('rescan must be at least 1.')
   directory = pathlib.Path(directory).expanduser()
   random = np.random.RandomState(seed)
   cache = {}
+  reported_short = frozenset()
   while True:
     filenames = sorted(directory.glob('*.npz'), reverse=True)
     if capacity:
@@ -218,8 +222,8 @@ def load_episodes(
         if total >= capacity:
           break
       filenames = selected
-      selected = set(filenames)
-      cache = {key: value for key, value in cache.items() if key in selected}
+    selected = set(filenames)
+    cache = {key: value for key, value in cache.items() if key in selected}
     for filename in filenames:
       if filename not in cache:
         try:
@@ -230,18 +234,26 @@ def load_episodes(
           print(f'Could not load episode: {e}')
           continue
         cache[filename] = episode
-    keys = list(cache.keys())
-    if not keys:
+    if not cache:
       raise RuntimeError(f'No episodes found in {directory}.')
+    keys = [key for key, episode in cache.items()
+            if not length or len(next(iter(episode.values()))) >= length]
+    short = frozenset(set(cache) - set(keys))
+    if short != reported_short:
+      print(f'Replay filter: {len(short)} short episodes excluded; '
+            f'{len(keys)} eligible episodes; required={length}.')
+      reported_short = short
+    if not keys:
+      longest = max(len(next(iter(ep.values()))) for ep in cache.values())
+      raise RuntimeError(
+          f'No eligible episodes in {directory}: required={length}, '
+          f'longest={longest}, loaded={len(cache)}. '
+          'Collect longer episodes or check the episode termination settings '
+          'and replay capacity.')
     for index in random.choice(len(keys), rescan):
       episode = cache[keys[index]]
       if length:
         total = len(next(iter(episode.values())))
-        if total < length:
-          print(
-              f'Skipped short episode: episode_length={total}, '
-              f'required={length}.')
-          continue
         available = total - length
         if balance:
           index = min(random.randint(0, total), available)

@@ -3,14 +3,14 @@
 Core algorithm follows the official danijar/dreamerv2 design:
 - categorical RSSM with straight-through samples
 - KL balancing
-- normalized vector, reward, and discount world-model heads
+- image, reward, and discount world-model heads
 - latent imagination actor-critic
 - mixed dynamics/REINFORCE actor gradient
 - slow target critic
 
-Task adaptations include a hybrid actor, exact vector observations, and a
-success-only reward. These change the observation/reward contract relative to
-the paper benchmark. The environment contract lives in envs.py.
+The only benchmark-specific extension is a hybrid actor distribution for the
+paper's (discrete action, continuous parameter) action space. There is no
+separate UAV adapter module; the environment contract lives in envs.py.
 """
 from __future__ import annotations
 import argparse, collections, functools, json, os, pathlib, sys, time
@@ -26,8 +26,8 @@ import wrappers
 
 def define_config():
   c = tools.AttrDict()
-  # Runtime. Fixed-contract runs use a new replay/checkpoint directory.
-  c.logdir = pathlib.Path('./outputs/dreamerv2_uav_relay_vector_v2')
+  # Runtime / benchmark. Paper-comparison defaults use Task 2.
+  c.logdir = pathlib.Path('./outputs/dreamerv2_uav_relay')
   c.seed = 0
   c.task = 'uav_relay'
   c.steps = 5e6
@@ -43,7 +43,8 @@ def define_config():
   c.log_images = False
   c.smoke = False
 
-  # Short UAV episodes use replay sequences of length 10.
+  # Replay. Official V2 defaults are batch=50,length=50; length=20 is the
+  # explicit UAV adaptation because paper episodes can terminate before 50.
   c.batch_size = 50
   c.batch_length = 10
   c.replay_capacity = 2_000_000
@@ -99,7 +100,7 @@ class DreamerV2(tools.Module):
     self.should_log = tools.Every(config.log_every)
     self.should_pretrain = tools.Once()
     metric_names = (
-        'model_loss', 'vector_loss', 'reward_loss', 'discount_loss', 'kl',
+        'model_loss', 'image_loss', 'reward_loss', 'discount_loss', 'kl',
         'actor_loss', 'critic_loss', 'model_grad_norm', 'actor_grad_norm',
         'critic_grad_norm')
     self.metrics = {
@@ -109,11 +110,11 @@ class DreamerV2(tools.Module):
     self._build_model()
 
   def _build_model(self):
-    self.encoder = models.VectorEncoder(self.c.num_units)
+    self.encoder = models.ConvEncoder(self.c.cnn_depth, tf.nn.elu)
     self.rssm = models.RSSM(
         self.c.rssm_stoch, self.c.rssm_deter, self.c.rssm_hidden,
         self.c.rssm_discrete, tf.nn.elu)
-    self.decoder = models.DenseHead((13,), 2, self.c.num_units, 'mse', tf.nn.elu)
+    self.decoder = models.ConvDecoder(self.c.cnn_depth, tf.nn.elu)
     self.reward = models.DenseHead((), 4, self.c.num_units, 'mse', tf.nn.elu)
     self.discount = models.DenseHead((), 4, self.c.num_units, 'binary', tf.nn.elu)
     self.actor = models.HybridActionDecoder(
@@ -148,8 +149,8 @@ class DreamerV2(tools.Module):
   @tf.function
   def policy(self, obs, state, training):
     if state is None:
-      latent = self.rssm.initial(tf.shape(obs['vector'])[0])
-      action = tf.zeros([tf.shape(obs['vector'])[0], self.actdim], self.float)
+      latent = self.rssm.initial(tf.shape(obs['image'])[0])
+      action = tf.zeros([tf.shape(obs['image'])[0], self.actdim], self.float)
     else:
       latent, action = state
     embed = self.encoder(preprocess(obs))
@@ -166,38 +167,34 @@ class DreamerV2(tools.Module):
       embed = self.encoder(data)
       post, prior = self.rssm.observe(embed, data['action'])
       feat = self.rssm.get_feat(post)
-      vector_dist = self.decoder(feat)
+      image_dist = self.decoder(feat)
       reward_dist = self.reward(feat)
       discount_dist = self.discount(feat)
-      vector_loss = -tf.reduce_mean(vector_dist.log_prob(data['vector']))
+      image_loss = -tf.reduce_mean(image_dist.log_prob(data['image']))
       reward_loss = -tf.reduce_mean(reward_dist.log_prob(data['reward']))
       discount_target = self.c.discount * data['discount']
       discount_loss = -tf.reduce_mean(discount_dist.log_prob(discount_target))
       kl_loss, kl_value = self.rssm.kl_loss(
           post, prior, self.c.kl_balance, self.c.kl_free, False)
-      model_loss = vector_loss + reward_loss + self.c.discount_scale*discount_loss + self.c.kl_scale*kl_loss
+      model_loss = image_loss + reward_loss + self.c.discount_scale*discount_loss + self.c.kl_scale*kl_loss
     model_norm = self.model_opt(model_tape, model_loss)
 
     with tf.GradientTape() as actor_tape:
       imag_feat, imag_action = self._imagine(post)
-      # Features are s_0,...,s_H; action[t] was chosen at s_t.
-      # Reward/continuation heads describe the arrival state s_(t+1).
-      reward = self.reward(imag_feat[1:]).mean()
-      discount = self.discount(imag_feat[1:]).mean()
+      reward = self.reward(imag_feat).mean()
+      discount = self.discount(imag_feat).mean()
       value = self.slow_critic(imag_feat).mean()
       returns = tools.lambda_return(
-          reward, value[:-1], discount, value[-1],
+          reward[:-1], value[:-1], discount[:-1], value[-1],
           self.c.discount_lambda, axis=0)
       weights = tf.stop_gradient(tf.math.cumprod(tf.concat(
-          [tf.ones_like(discount[:1]), discount[:-1]], 0), 0))
-      # Do not optimize imagined actions starting from true terminal states.
-      weights *= tf.reshape(tf.stop_gradient(data['discount']), [1, -1])
+          [tf.ones_like(discount[:1]), discount[:-2]], 0), 0))
       # Hybrid parameterized-action gradient split:
       # discrete MOVE/TURN/CATCH -> REINFORCE; continuous parameters -> dynamics gradient.
       actor_dist = self.actor(tf.stop_gradient(imag_feat[:-1]))
       baseline = self.critic(imag_feat[:-1]).mean()
       advantage = tf.stop_gradient(returns - baseline)
-      discrete_score = actor_dist.discrete_log_prob(imag_action) * advantage
+      discrete_score = actor_dist.discrete_log_prob(imag_action[:-1]) * advantage
       entropy = actor_dist.entropy()
       dynamics_target = returns
       actor_loss = -tf.reduce_mean(weights * (
@@ -214,7 +211,7 @@ class DreamerV2(tools.Module):
     if self.c.slow_target and tf.equal(self._updates % self.c.slow_target_update, 0):
       self._update_slow_target(self.c.slow_target_fraction)
     if not init_only:
-      for name, value in dict(model_loss=model_loss, vector_loss=vector_loss,
+      for name, value in dict(model_loss=model_loss, image_loss=image_loss,
           reward_loss=reward_loss, discount_loss=discount_loss, kl=kl_value,
           actor_loss=actor_loss, critic_loss=critic_loss,
           model_grad_norm=model_norm, actor_grad_norm=actor_norm,
@@ -223,9 +220,14 @@ class DreamerV2(tools.Module):
 
   def _imagine(self, post):
     flatten = lambda x: tf.reshape(x, [-1] + list(x.shape[2:]))
-    start = {k: tf.stop_gradient(flatten(v)) for k,v in post.items()}
+    start = {k: flatten(v) for k,v in post.items()}
+    def step(prev, _):
+      feat = self.rssm.get_feat(prev)
+      action = self.actor(feat).sample()
+      state = self.rssm.img_step(prev, action)
+      return state, action
     state = start
-    states, actions = [state], []
+    states, actions = [], []
     for _ in range(self.c.imag_horizon):
       feat = self.rssm.get_feat(state)
       action = self.actor(feat).sample()
@@ -262,9 +264,7 @@ def preprocess(obs):
   if 'discount' in obs:
     obs['discount'] = tf.cast(obs['discount'], dtype)
   if 'action' in obs:
-    obs['action'] = models.canonical_action(tf.cast(obs['action'], dtype))
-  if 'vector' in obs:
-    obs['vector'] = tf.cast(obs['vector'], dtype)
+    obs['action'] = tf.cast(obs['action'], dtype)
   return obs
 
 
@@ -274,12 +274,9 @@ def count_steps(datadir, config):
 
 def load_dataset(directory, config):
   episode = next(tools.load_episodes(directory, 1))
-  if 'vector' not in episode:
-    raise ValueError('Old image replay is incompatible. Use a fresh --logdir for vector_v2.')
   types = {k:v.dtype for k,v in episode.items()}
   shapes = {k:(None,)+v.shape[1:] for k,v in episode.items()}
-  # Rescan at batch granularity instead of once per sampled sequence.
-  gen = lambda: tools.load_episodes(directory, max(config.batch_size, config.train_steps), config.batch_length,
+  gen = lambda: tools.load_episodes(directory, config.train_steps, config.batch_length,
                                     False, capacity=config.replay_capacity)
   sig = {k:tf.TensorSpec(shapes[k], types[k]) for k in types}
   ds = tf.data.Dataset.from_generator(gen, output_signature=sig)
@@ -379,8 +376,7 @@ def main(config):
   step = count_steps(datadir, config)
   prefill = max(0, config.prefill - step)
   tqdm.write(f'Prefill: {prefill} environment steps')
-  random_agent = lambda o, d, s: (models.canonical_action(
-      tf.convert_to_tensor(np.stack([actspace.sample() for _ in d]))).numpy(), None)
+  random_agent = lambda o, d, s: ([actspace.sample() for _ in d], None)
   tools.simulate(random_agent, train, prefill / config.action_repeat)
   agent = DreamerV2(config, datadir, actspace, writer)
   state = None

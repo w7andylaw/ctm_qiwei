@@ -1,8 +1,9 @@
 """DreamerV2 model components adapted from the official DreamerV2 design.
 
 The world-model structure follows danijar/dreamerv2: categorical RSSM,
-KL balancing and imagined actor-critic learning. UAV training uses exact vector
-observations and vector/reward/discount heads, with a hybrid action decoder.
+KL balancing, image/reward/discount heads, and imagined actor-critic learning.
+The only task-specific extension is HybridActionDecoder for the UAV benchmark's
+parameterized action space (categorical action + continuous per-action parameter).
 """
 import numpy as np
 import tensorflow as tf
@@ -10,21 +11,6 @@ from tensorflow.keras import layers as tfkl
 from tensorflow_probability import distributions as tfd
 from tensorflow.keras import mixed_precision as prec
 import tools
-
-
-def canonical_action(action):
-  """One-hot choice plus only the executed MOVE/TURN parameter.
-
-  Keep the all-zero reset action zero. CATCH (index 2) has no parameter.
-  Used at the RSSM boundary too, so ignored parameters cannot affect dynamics.
-  """
-  k = action.shape[-1] // 2
-  choice, params = action[..., :k], action[..., k:]
-  selected = tf.one_hot(tf.argmax(choice, -1), k, dtype=action.dtype)
-  valid = tf.reduce_any(tf.not_equal(action, 0), -1, keepdims=True)
-  selected = tf.stop_gradient(selected * tf.cast(valid, action.dtype))
-  mask = selected * tf.cast(tf.range(k) < 2, action.dtype)
-  return tf.concat([selected, params * mask], -1)
 
 
 class RSSM(tools.Module):
@@ -101,7 +87,6 @@ class RSSM(tools.Module):
 
   @tf.function
   def img_step(self, prev_state, prev_action):
-    prev_action = canonical_action(prev_action)
     stoch = tf.reshape(prev_state['stoch'], [tf.shape(prev_state['stoch'])[0], -1])
     x = tf.concat([stoch, prev_action], -1)
     x = self.get('img1', tfkl.Dense, self._hidden, self._act)(x)
@@ -123,18 +108,6 @@ class RSSM(tools.Module):
     loss = float(balance) * loss_lhs + (1.0 - float(balance)) * loss_rhs
     value = tf.reduce_mean(tfd.kl_divergence(self.get_dist(post), self.get_dist(prior)))
     return loss, value
-
-
-class VectorEncoder(tools.Module):
-  """Encode normalized navigation measurements, including goals and phase."""
-  def __init__(self, units=400):
-    self._units = units
-
-  def __call__(self, obs):
-    x = obs['vector']
-    for i in range(2):
-      x = self.get(f'h{i}', tfkl.Dense, self._units, tf.nn.elu)(x)
-    return x
 
 
 class ConvEncoder(tools.Module):
@@ -185,7 +158,7 @@ class DenseHead(tools.Module):
 class HybridDist:
   """Stable parameterized-action distribution for UAV control.
 
-  The discrete branch uses a hard categorical sample trained by REINFORCE. The
+  The discrete branch uses a straight-through categorical sample. The
   continuous branch uses a reparameterized Gaussian followed by tanh for
   environment/RSSM actions, but policy log-probabilities are evaluated in the
   pre-tanh Gaussian space. This avoids the singular tanh inverse/Jacobian near
@@ -194,8 +167,7 @@ class HybridDist:
   Only the parameter belonging to the selected discrete action contributes to
   the REINFORCE log-probability and entropy. Unselected parameter heads remain
   available for differentiable imagination but do not add irrelevant policy
-  gradient terms. Unselected parameters and CATCH's parameter are zeroed before
-  the action reaches either the environment or the RSSM.
+  gradient terms.
   """
   def __init__(self, logits, mean, std):
     self.logits = logits
@@ -218,20 +190,21 @@ class HybridDist:
     raw = self.mean_tensor + self.std_tensor * tf.random.normal(
         tf.shape(self.mean_tensor), dtype=self.mean_tensor.dtype)
     params = tf.tanh(raw)
-    return canonical_action(tf.concat([select, params], -1))
+    return tf.concat([select, params], -1)
 
   def mode(self):
     idx = tf.argmax(self.logits, -1, output_type=tf.int32)
     select = tf.one_hot(idx, tf.shape(self.logits)[-1], dtype=self.logits.dtype)
     params = tf.tanh(self.mean_tensor)
-    return canonical_action(tf.concat([select, params], -1))
+    return tf.concat([select, params], -1)
 
   def entropy(self):
-    # Expected conditional pre-tanh entropy over meaningful MOVE/TURN heads.
-    # CATCH has no continuous control and contributes no parameter entropy.
-    probs = tf.nn.softmax(self.logits, -1)
-    active = tf.cast(tf.range(tf.shape(self.logits)[-1]) < 2, probs.dtype)
-    param_ent = tf.reduce_sum(self._normal.entropy() * probs * active, -1)
+    # Entropy regularizes the categorical choice and only the parameter of the
+    # currently most likely action. This avoids summing K irrelevant parameter
+    # entropies for a single parameterized action.
+    idx = tf.argmax(self.logits, -1, output_type=tf.int32)
+    onehot = tf.one_hot(idx, tf.shape(self.logits)[-1], dtype=self.logits.dtype)
+    param_ent = tf.reduce_sum(self._normal.entropy() * onehot, -1)
     return self._cat.entropy() + param_ent
 
   def discrete_log_prob(self, action):
@@ -246,7 +219,6 @@ class HybridDist:
     select, params = action[..., :k], action[..., k:]
     idx = tf.argmax(select, -1, output_type=tf.int32)
     onehot = tf.one_hot(idx, k, dtype=params.dtype)
-    onehot *= tf.cast(tf.range(k) < 2, params.dtype)
 
     # Stable pre-tanh approximation. Stop gradients through the sampled action
     # value for the score-function term; gradients flow through distribution

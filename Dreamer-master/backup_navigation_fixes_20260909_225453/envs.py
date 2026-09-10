@@ -767,9 +767,7 @@ class GoalObservationEncoder:
 class DreamerV2UAVEnv:
     """Expose the paper UAV task directly to DreamerV2.
 
-    The base environment retains paper rewards; this interface uses success=1,
-    otherwise=0 to avoid rewarding early failure under negative step costs.
-    It exposes exact normalized vectors plus optional diagnostic images. The action
+    The environment keeps the paper dynamics/reward untouched. The action
     vector used by DreamerV2 is [onehot/action-selection K, parameters K].
     This flat representation is also what the RSSM receives, so no external
     adapter module is required.
@@ -798,7 +796,6 @@ class DreamerV2UAVEnv:
     def observation_space(self):
         base = self.env.observation_space.spaces
         result = {
-            "vector": spaces.Box(-np.inf, np.inf, shape=(13,), dtype=np.float32),
             "image": spaces.Box(0, 255, self.size + (3,), dtype=np.uint8),
             "state": base["observation"],
             "achieved_goal": base["achieved_goal"],
@@ -847,11 +844,7 @@ class DreamerV2UAVEnv:
                     terminated=bool(terminated), truncated=bool(truncated),
                     action_discrete=np.int32(hybrid[0]),
                     action_parameter=np.float32(hybrid[1][0]))
-        # Dreamer training contract: success-only sparse reward. Early failure
-        # cannot improve return by avoiding negative step costs. Base paper
-        # environments retain their original reward for separate comparisons.
-        reward = float(bool(info.get("is_success", False)) and not bool(info.get("out_of_bounds", False)))
-        return self._convert_obs(obs, info), reward, done, info
+        return self._convert_obs(obs, info), float(reward), done, info
 
     def close(self):
         return self.env.close()
@@ -859,7 +852,6 @@ class DreamerV2UAVEnv:
     def _convert_obs(self, obs, info=None):
         info = info or {}
         out = {
-            "vector": self._vector_obs(),
             "image": self._render(obs),
             "state": np.asarray(obs["observation"], np.float32),
             "achieved_goal": np.asarray(obs["achieved_goal"], np.float32),
@@ -870,30 +862,6 @@ class DreamerV2UAVEnv:
                     "relay_reached", "carrying_supply"):
             out[key] = np.asarray(float(bool(info.get(key, False))), np.float32)
         return out
-
-    def _vector_obs(self):
-        """13 normalized coordinates; goals remain visible after phase changes.
-
-        [x, y, speed, sin_heading, cos_heading, final_dx, final_dy,
-         supply_dx, supply_dy, elapsed, phase, active_dx, active_dy]
-        Relative supply denotes the fixed pickup location, matching relay_goal.
-        """
-        state = self.env.state
-        position = state.position
-        scale = self.env.map_size
-        final = self.env.final_goal if self.task == "relay" else self.env.goal
-        supply = self.env.relay_goal if self.task == "relay" else position
-        active = self.env.current_goal
-        return np.asarray([
-            *(2.0 * position / scale - 1.0),
-            2.0 * state.speed / self.env.dynamics.max_speed - 1.0,
-            np.sin(state.heading), np.cos(state.heading),
-            *((final - position) / scale),
-            *((supply - position) / scale),
-            2.0 * self.env.elapsed_steps / self.env.max_episode_steps - 1.0,
-            float(self.env.current_phase),
-            *((active - position) / scale),
-        ], dtype=np.float32)
 
     def _render(self, obs):
         height, width = self.size
